@@ -54,7 +54,7 @@ def get_cifar10_dataloaders(root: str = "./data", batch_size: int = 128, num_wor
 # =====================================================================
 class ConvPotatoEncoder(nn.Module):
     """Encodes a 3x32x32 CIFAR-10 image into the initial potato vector z_0."""
-    def __init__(self, d_model: int = 256):
+    def __init__(self, d_model: int = 128):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
@@ -81,7 +81,7 @@ class Expert(nn.Module):
     A single specialized expert that processes the potato and applies
     a gated residual update to preserve core state information.
     """
-    def __init__(self, d_model: int = 256, d_hidden: int = 512, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, d_hidden: int = 512, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_hidden),
@@ -106,7 +106,7 @@ class ParadeController(nn.Module):
       2. Halting confidence probability
       3. Expert routing logits
     """
-    def __init__(self, d_model: int = 256, num_classes: int = 10, num_experts: int = 4, max_steps: int = 4):
+    def __init__(self, d_model: int = 128, num_classes: int = 10, num_experts: int = 8, max_steps: int = 4):
         super().__init__()
         self.step_embed = nn.Embedding(max_steps + 1, d_model)
         self.classifier = nn.Linear(d_model, num_classes)
@@ -140,9 +140,9 @@ class ParadeController(nn.Module):
 class ParadeOfExpertsCIFAR(nn.Module):
     def __init__(
         self,
-        d_model: int = 256,
+        d_model: int = 128,
         num_classes: int = 10,
-        num_experts: int = 4,
+        num_experts: int = 8,
         max_steps: int = 3
     ):
         super().__init__()
@@ -276,7 +276,7 @@ class ParadeOfExpertsCIFAR(nn.Module):
         return total_task_loss, total_router_loss, total_halt_loss, metrics
 
     @torch.no_grad()
-    def forward_inference(self, x: torch.Tensor, threshold: float = 0.80):
+    def forward_inference(self, x: torch.Tensor, threshold: float = 0.90):
         """
         Test-Time Inference:
           - No ground-truth labels or all-expert lookahead.
@@ -333,7 +333,7 @@ class ParadeOfExpertsCIFAR(nn.Module):
 # =====================================================================
 # 3. Training & Evaluation Loop
 # =====================================================================
-def evaluate_cifar10(model: ParadeOfExpertsCIFAR, loader: DataLoader, device: torch.device, threshold: float = 0.80):
+def evaluate_cifar10(model: ParadeOfExpertsCIFAR, loader: DataLoader, device: torch.device, threshold: float = 0.90):
     """
     Evaluates accuracy, average expert passes per image, and the breakdown
     of how many images halted at each step on standard CIFAR-10.
@@ -381,7 +381,7 @@ def main():
     model = ParadeOfExpertsCIFAR(
         d_model=256,
         num_classes=10,
-        num_experts=4,
+        num_experts=8,
         max_steps=3
     ).to(device)
 
@@ -416,7 +416,7 @@ def main():
 
         scheduler.step()
         num_batches = len(train_loader)
-        test_acc, avg_steps, halt_dist = evaluate_cifar10(model, test_loader, device, threshold=0.80)
+        test_acc, avg_steps, halt_dist = evaluate_cifar10(model, test_loader, device, threshold=0.90)
 
         dist_str = ", ".join([f"E{i}:{p:.2f}" for i, p in enumerate(last_dist)])
         halt_str = ", ".join([f"S{s}:{p:.2f}" for s, p in enumerate(halt_dist)])
