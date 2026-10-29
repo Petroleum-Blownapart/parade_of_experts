@@ -52,20 +52,46 @@ def get_cifar10_dataloaders(root: str = "./data", batch_size: int = 128, num_wor
 # =====================================================================
 # 2. Parade of Experts Architecture (CIFAR-10)
 # =====================================================================
+class ResidualConvBlock(nn.Module):
+    """Residual convolutional block with optional spatial downsampling."""
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.act = nn.GELU()
+
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.act(out + self.shortcut(x))
+
+
 class ConvPotatoEncoder(nn.Module):
-    """Encodes a 3x32x32 CIFAR-10 image into the initial potato vector z_0."""
-    def __init__(self, d_model: int = 128):
+    """Encodes a 3x32x32 CIFAR-10 image into the initial 1D potato vector z_0."""
+    def __init__(self, d_model: int = 256):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
+            # 32x32
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),  # 16x16
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False), # 8x8
-            nn.BatchNorm2d(256),
-            nn.GELU(),
+            ResidualConvBlock(64, 64, stride=1),
+            # 16x16
+            ResidualConvBlock(64, 128, stride=2),
+            # 8x8
+            ResidualConvBlock(128, 256, stride=2),
+            # 4x4
+            ResidualConvBlock(256, 256, stride=2),
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
             nn.Linear(256, d_model),
@@ -78,10 +104,10 @@ class ConvPotatoEncoder(nn.Module):
 
 class Expert(nn.Module):
     """
-    A single specialized expert that processes the potato and applies
+    A single specialized expert that processes the 1D potato and applies
     a gated residual update to preserve core state information.
     """
-    def __init__(self, d_model: int = 128, d_hidden: int = 512, dropout: float = 0.1):
+    def __init__(self, d_model: int = 256, d_hidden: int = 512, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_hidden),
@@ -106,19 +132,21 @@ class ParadeController(nn.Module):
       2. Halting confidence probability
       3. Expert routing logits
     """
-    def __init__(self, d_model: int = 128, num_classes: int = 10, num_experts: int = 8, max_steps: int = 4):
+    def __init__(self, d_model: int = 256, num_classes: int = 10, num_experts: int = 8, max_steps: int = 4):
         super().__init__()
         self.step_embed = nn.Embedding(max_steps + 1, d_model)
         self.classifier = nn.Linear(d_model, num_classes)
         self.router = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
             nn.GELU(),
-            nn.Linear(d_model // 2, num_experts)
+            nn.Linear(d_model, num_experts)
         )
         self.halter = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 4, 1)
+            nn.Linear(d_model // 2, 1)
         )
 
     def classify_only(self, z: torch.Tensor, step: int) -> torch.Tensor:
@@ -140,7 +168,7 @@ class ParadeController(nn.Module):
 class ParadeOfExpertsCIFAR(nn.Module):
     def __init__(
         self,
-        d_model: int = 128,
+        d_model: int = 256,
         num_classes: int = 10,
         num_experts: int = 8,
         max_steps: int = 3
@@ -157,22 +185,28 @@ class ParadeOfExpertsCIFAR(nn.Module):
             Expert(d_model, d_model * 2) for _ in range(num_experts)
         ])
 
-        # Track EMA of expert win frequencies to prevent Epoch-1 collapse
-        self.register_buffer("expert_freq_ema", torch.full((num_experts,), 1.0 / num_experts))
+        # Track per-step EMA of expert win frequencies to prevent collapse at any pass
+        self.register_buffer(
+            "expert_freq_ema",
+            torch.full((max_steps, num_experts), 1.0 / num_experts)
+        )
 
     def forward_train_wta(
         self,
         x: torch.Tensor,
         labels: torch.Tensor,
         margin_weight: float = 0.1,
-        improvement_delta: float = 0.05
+        improvement_delta: float = 0.15,
+        halt_conf_target: float = 0.85,
+        router_sample_prob: float = 0.0
     ):
         """
-        Oracle-Guided Winner-Take-All (WTA) Training Pass:
+        Oracle-Guided Winner-Take-All (WTA) Training Pass with Scheduled Sampling:
           - Evaluates ALL experts at each step.
           - Finds which expert yields the lowest Cross-Entropy loss per sample.
           - Trains the router to predict that winning expert.
-          - Backpropagates task gradients ONLY through the winning expert's route.
+          - Uses progressive step weights so later passes are strongly incentivized to refine z.
+          - Uses scheduled sampling (router_sample_prob) to bridge WTA training and top-1 test routing.
         """
         B = x.size(0)
         batch_indices = torch.arange(B, device=x.device)
@@ -184,7 +218,11 @@ class ParadeOfExpertsCIFAR(nn.Module):
         logits_0, halt_logit_0, router_logits_0 = self.controller(z, step=0)
         loss_t = F.cross_entropy(logits_0, labels, reduction="none")  # (B,)
 
-        total_task_loss = loss_t.mean()
+        # Progressive step weights: weight later passes higher so experts learn deep refinement
+        step_weights = [0.5 + 0.5 * s for s in range(self.max_steps + 1)]
+        weight_sum = sum(step_weights)
+
+        total_task_loss = step_weights[0] * loss_t.mean()
         total_router_loss = torch.tensor(0.0, device=x.device)
         total_halt_loss = torch.tensor(0.0, device=x.device)
 
@@ -211,23 +249,31 @@ class ParadeOfExpertsCIFAR(nn.Module):
                 candidate_losses = F.cross_entropy(flat_logits, flat_labels, reduction="none")
                 candidate_losses = candidate_losses.view(B, self.num_experts)  # (B, N)
 
-                # Add slight load-balancing handicap during early warm-up to prevent dead experts
-                freq_bias = margin_weight * (self.expert_freq_ema - (1.0 / self.num_experts))
+                # Per-step load-balancing handicap to prevent dead experts
+                freq_bias = margin_weight * (self.expert_freq_ema[step] - (1.0 / self.num_experts))
                 selection_scores = candidate_losses + freq_bias.unsqueeze(0)
 
                 # Best expert index per instance: (B,)
                 best_expert_idx = torch.argmin(selection_scores, dim=1)
                 min_next_loss = candidate_losses[batch_indices, best_expert_idx]
 
-                # Update EMA of winning expert frequencies
+                # Update per-step EMA of winning expert frequencies
                 batch_counts = torch.bincount(best_expert_idx, minlength=self.num_experts).float()
                 expert_win_counts += batch_counts
-                self.expert_freq_ema.mul_(0.95).add_(0.05 * (batch_counts / B))
+                self.expert_freq_ema[step].mul_(0.95).add_(0.05 * (batch_counts / B))
 
-                # Oracle halting target: halt (1.0) if already correct AND expert improves loss by < delta
-                already_correct = (curr_logits.argmax(dim=-1) == labels)
-                minimal_gain = (curr_loss - min_next_loss) < improvement_delta
-                oracle_halt_target = (already_correct & minimal_gain).float()
+                # Stricter Oracle halting target:
+                # Never encourage halting at step 0 (force at least 1 expert pass), and require
+                # high confidence on the true class + minimal relative loss gain on subsequent steps.
+                if step == 0:
+                    oracle_halt_target = torch.zeros(B, device=x.device)
+                else:
+                    curr_probs = F.softmax(curr_logits, dim=-1)
+                    true_class_prob = curr_probs[batch_indices, labels]
+                    high_confidence = (curr_logits.argmax(dim=-1) == labels) & (true_class_prob >= halt_conf_target)
+                    relative_gain = (curr_loss - min_next_loss) / (curr_loss.clamp(min=1e-4))
+                    minimal_gain = relative_gain < improvement_delta
+                    oracle_halt_target = (high_confidence & minimal_gain).float()
 
             # 5. Train the Router using the winning expert as ground-truth target
             step_router_loss = F.cross_entropy(curr_router_logits, best_expert_idx)
@@ -242,25 +288,29 @@ class ParadeOfExpertsCIFAR(nn.Module):
             step_halt_loss = F.binary_cross_entropy_with_logits(curr_halt_logit, oracle_halt_target)
             total_halt_loss = total_halt_loss + step_halt_loss
 
-            # 7. Select ONLY the winning potato and winning logits for the computation graph!
-            # Indexing with [batch_indices, best_expert_idx] ensures backprop ONLY updates
-            # the winning expert for each instance; non-winning experts get zero gradient.
-            z = candidate_potatoes[batch_indices, best_expert_idx]  # (B, d_model)
+            # 7. Select winning potato for task loss, with Scheduled Sampling for the next step's state
             winning_logits = candidate_logits[batch_indices, best_expert_idx]  # (B, num_classes)
-
-            # Compute differentiable task loss along the winning route
             winning_loss = F.cross_entropy(winning_logits, labels, reduction="none")
-            total_task_loss = total_task_loss + winning_loss.mean()
+            total_task_loss = total_task_loss + step_weights[step + 1] * winning_loss.mean()
+
+            if router_sample_prob > 0.0 and step < self.max_steps - 1:
+                use_router_mask = torch.rand(B, device=x.device) < router_sample_prob
+                next_expert_idx = torch.where(use_router_mask, router_preds, best_expert_idx)
+                z = candidate_potatoes[batch_indices, next_expert_idx]
+                step_next_logits = candidate_logits[batch_indices, next_expert_idx]
+                curr_loss = F.cross_entropy(step_next_logits.detach(), labels, reduction="none")
+            else:
+                z = candidate_potatoes[batch_indices, best_expert_idx]
+                curr_loss = winning_loss.detach()
 
             # Prepare controller outputs for the next step
             if step < self.max_steps - 1:
                 curr_logits, curr_halt_logit, curr_router_logits = self.controller(z, step=step + 1)
-                curr_loss = winning_loss
             else:
                 curr_logits = winning_logits
 
-        # Average losses across steps
-        total_task_loss = total_task_loss / (self.max_steps + 1)
+        # Normalize losses across steps
+        total_task_loss = total_task_loss / weight_sum
         total_router_loss = total_router_loss / self.max_steps
         total_halt_loss = total_halt_loss / self.max_steps
 
@@ -276,11 +326,11 @@ class ParadeOfExpertsCIFAR(nn.Module):
         return total_task_loss, total_router_loss, total_halt_loss, metrics
 
     @torch.no_grad()
-    def forward_inference(self, x: torch.Tensor, threshold: float = 0.90):
+    def forward_inference(self, x: torch.Tensor, threshold: float = 0.90, min_steps: int = 1):
         """
         Test-Time Inference:
           - No ground-truth labels or all-expert lookahead.
-          - Controller halts early when confidence >= threshold.
+          - Controller halts early when confidence >= threshold (after min_steps).
           - Otherwise routes each sample ONLY to the top-1 predicted expert.
         """
         B = x.size(0)
@@ -294,15 +344,17 @@ class ParadeOfExpertsCIFAR(nn.Module):
             logits, halt_logit, router_logits = self.controller(z, step=step)
             halt_prob = torch.sigmoid(halt_logit)
 
-            # Entropy-assisted confidence can also be blended with learned halt_prob
+            # Combine learned halt_prob with max class probability (more conservative than entropy)
             probs = F.softmax(logits, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-            norm_conf = 1.0 - (entropy / math.log(self.num_classes))
-            combined_conf = 0.5 * halt_prob + 0.5 * norm_conf
+            max_prob = probs.max(dim=-1).values
+            combined_conf = torch.minimum(halt_prob, max_prob)
 
             if step == self.max_steps:
                 # Force halt on final step
                 just_halted = active_mask
+            elif step < min_steps:
+                # Enforce at least min_steps expert passes before allowing early exit
+                just_halted = torch.zeros(B, dtype=torch.bool, device=x.device)
             else:
                 just_halted = active_mask & (combined_conf >= threshold)
 
@@ -390,8 +442,10 @@ def main():
 
     for epoch in range(1, epochs + 1):
         model.train()
-        # Decay the anti-collapse margin over the first 5 epochs
-        margin_weight = max(0.0, 0.15 * (1.0 - (epoch - 1) / 5.0))
+        # Keep a persistent 0.03 load-balancing floor after initial warm-up decay
+        margin_weight = max(0.03, 0.15 * (1.0 - (epoch - 1) / 8.0))
+        # Scheduled sampling: ramp router trajectory sampling from 0.0 -> 0.5 after epoch 5
+        router_sample_prob = min(0.5, max(0.0, (epoch - 5) / 15.0))
 
         running_acc = 0.0
         running_router_acc = 0.0
@@ -402,7 +456,10 @@ def main():
 
             optimizer.zero_grad()
             task_loss, router_loss, halt_loss, metrics = model.forward_train_wta(
-                images, labels, margin_weight=margin_weight
+                images,
+                labels,
+                margin_weight=margin_weight,
+                router_sample_prob=router_sample_prob
             )
 
             loss = task_loss + lambda_router * router_loss + lambda_halt * halt_loss
