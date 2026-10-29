@@ -80,7 +80,6 @@ A central challenge in MoE and adaptive-depth models is that discrete routing is
    $$\mathcal{L}_{\text{router}}^{(t)} = \text{CrossEntropy}\left(r_t, \, i^*\right)$$
 5. **Oracle Halting Target & Halting Loss ($\mathcal{L}_{\text{halt}}$):**
    How does the halting gate learn when to stop? We construct a binary ground-truth target `oracle_halt_target` $\in \{0, 1\}$:
-   - **At $t = 0$ (0 expert passes):** `oracle_halt_target = 0`. The model is never taught to halt before consulting at least one expert.
    - **At $t \ge 1$:** `oracle_halt_target = 1` **if and only if** all three conditions hold:
      1. The current prediction is already correct ($\arg\max \hat{y}_t = y$).
      2. The current true-class probability is already high ($p_t(y) \ge 0.85$).

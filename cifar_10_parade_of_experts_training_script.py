@@ -263,17 +263,14 @@ class ParadeOfExpertsCIFAR(nn.Module):
                 self.expert_freq_ema[step].mul_(0.95).add_(0.05 * (batch_counts / B))
 
                 # Stricter Oracle halting target:
-                # Never encourage halting at step 0 (force at least 1 expert pass), and require
-                # high confidence on the true class + minimal relative loss gain on subsequent steps.
-                if step == 0:
-                    oracle_halt_target = torch.zeros(B, device=x.device)
-                else:
-                    curr_probs = F.softmax(curr_logits, dim=-1)
-                    true_class_prob = curr_probs[batch_indices, labels]
-                    high_confidence = (curr_logits.argmax(dim=-1) == labels) & (true_class_prob >= halt_conf_target)
-                    relative_gain = (curr_loss - min_next_loss) / (curr_loss.clamp(min=1e-4))
-                    minimal_gain = relative_gain < improvement_delta
-                    oracle_halt_target = (high_confidence & minimal_gain).float()
+                # require high confidence on the true class + minimal relative loss gain on subsequent steps.
+                
+                curr_probs = F.softmax(curr_logits, dim=-1)
+                true_class_prob = curr_probs[batch_indices, labels]
+                high_confidence = (curr_logits.argmax(dim=-1) == labels) & (true_class_prob >= halt_conf_target)
+                relative_gain = (curr_loss - min_next_loss) / (curr_loss.clamp(min=1e-4))
+                minimal_gain = relative_gain < improvement_delta
+                oracle_halt_target = (high_confidence & minimal_gain).float()
 
             # 5. Train the Router using the winning expert as ground-truth target
             step_router_loss = F.cross_entropy(curr_router_logits, best_expert_idx)
