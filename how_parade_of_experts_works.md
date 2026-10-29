@@ -79,13 +79,10 @@ A central challenge in MoE and adaptive-depth models is that discrete routing is
    Because the Oracle identifies which expert *actually* helped sample $b$ the most ($i^*_b$), training the router becomes a direct supervised classification task using Cross-Entropy:
    $$\mathcal{L}_{\text{router}}^{(t)} = \text{CrossEntropy}\left(r_t, \, i^*\right)$$
 5. **Oracle Halting Target & Halting Loss ($\mathcal{L}_{\text{halt}}$):**
-   How does the halting gate learn when to stop? We construct a binary ground-truth target `oracle_halt_target` $\in \{0, 1\}$:
-   - **At $t \ge 1$:** `oracle_halt_target = 1` **if and only if** all three conditions hold:
-     1. The current prediction is already correct ($\arg\max \hat{y}_t = y$).
-     2. The current true-class probability is already high ($p_t(y) \ge 0.85$).
-     3. Even the best expert at the next step provides less than a $15\%$ relative loss reduction:
-        $$\frac{\mathcal{L}_t - \mathcal{L}_{t+1, i^*}}{\max(\mathcal{L}_t, 10^{-4})} < 0.15$$
-   - The halting head is trained against this target via Binary Cross-Entropy with Logits ($\mathcal{L}_{\text{halt}}^{(t)}$).
+   How does the halting gate learn when to stop? We compute a smooth, continuous target `oracle_halt_target` $\in (0, 1]$ from the classifier's Cross-Entropy loss $\mathcal{L}_t$ at step $t$:
+   $$y_{\text{halt}}^{(t)} = \exp\left(-g \cdot \mathcal{L}_t\right) = \left(p_t(y)\right)^g$$
+   where $g$ (`halt_gamma = 3.0`) is a strictness coefficient that controls how low the classifier's Cross-Entropy loss (or equivalently, how high the true-class probability $p_t(y)$) must be before the halting gate is encouraged to output a high halt score.
+   - The halting head is trained against this continuous target via Binary Cross-Entropy with Logits ($\mathcal{L}_{\text{halt}}^{(t)}$).
 6. **Winner-Take-All Task Backpropagation & Progressive Step Weighting ($\mathcal{L}_{\text{task}}$):**
    For the classification task loss, we select **only** the winning expert's logits $\hat{y}_{t+1, i^*_b}$ for each sample. Non-winning experts receive zero task gradient on that sample, allowing experts to specialize in distinct niches.
    - To incentivize multi-pass refinement rather than dumping the entire burden onto the encoder at step 0, steps are weighted progressively higher (`step_weights = [0.5, 1.0, 1.5, 2.0]` for $t = 0, 1, 2, 3$):

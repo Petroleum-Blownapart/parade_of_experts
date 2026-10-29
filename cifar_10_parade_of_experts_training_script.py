@@ -196,8 +196,7 @@ class ParadeOfExpertsCIFAR(nn.Module):
         x: torch.Tensor,
         labels: torch.Tensor,
         margin_weight: float = 0.1,
-        improvement_delta: float = 0.15,
-        halt_conf_target: float = 0.85,
+        halt_gamma: float = 3.0,
         router_sample_prob: float = 0.0
     ):
         """
@@ -205,6 +204,8 @@ class ParadeOfExpertsCIFAR(nn.Module):
           - Evaluates ALL experts at each step.
           - Finds which expert yields the lowest Cross-Entropy loss per sample.
           - Trains the router to predict that winning expert.
+          - Trains the halting gate against exp(-g * curr_loss), where g (halt_gamma)
+            controls how strict the halting gate is.
           - Uses progressive step weights so later passes are strongly incentivized to refine z.
           - Uses scheduled sampling (router_sample_prob) to bridge WTA training and top-1 test routing.
         """
@@ -255,22 +256,15 @@ class ParadeOfExpertsCIFAR(nn.Module):
 
                 # Best expert index per instance: (B,)
                 best_expert_idx = torch.argmin(selection_scores, dim=1)
-                min_next_loss = candidate_losses[batch_indices, best_expert_idx]
 
                 # Update per-step EMA of winning expert frequencies
                 batch_counts = torch.bincount(best_expert_idx, minlength=self.num_experts).float()
                 expert_win_counts += batch_counts
                 self.expert_freq_ema[step].mul_(0.95).add_(0.05 * (batch_counts / B))
 
-                # Stricter Oracle halting target:
-                # require high confidence on the true class + minimal relative loss gain on subsequent steps.
-                
-                curr_probs = F.softmax(curr_logits, dim=-1)
-                true_class_prob = curr_probs[batch_indices, labels]
-                high_confidence = (curr_logits.argmax(dim=-1) == labels) & (true_class_prob >= halt_conf_target)
-                relative_gain = (curr_loss - min_next_loss) / (curr_loss.clamp(min=1e-4))
-                minimal_gain = relative_gain < improvement_delta
-                oracle_halt_target = (high_confidence & minimal_gain).float()
+                # Smooth Exponential Oracle Halting Target: exp(-g * curr_loss)
+                # Equivalent to (p_true_class)^g, smoothly mapping loss in [0, inf) -> (0, 1].
+                oracle_halt_target = torch.exp(-halt_gamma * curr_loss.detach())
 
             # 5. Train the Router using the winning expert as ground-truth target
             step_router_loss = F.cross_entropy(curr_router_logits, best_expert_idx)
@@ -422,6 +416,7 @@ def main():
     lr = 1e-3
     lambda_router = 0.5
     lambda_halt = 0.25
+    halt_gamma = 3.0  # Strictness coefficient g in exp(-g * CE_loss)
 
     train_loader, test_loader = get_cifar10_dataloaders(
         root="./data", batch_size=batch_size, num_workers=2
@@ -456,6 +451,7 @@ def main():
                 images,
                 labels,
                 margin_weight=margin_weight,
+                halt_gamma=halt_gamma,
                 router_sample_prob=router_sample_prob
             )
 
